@@ -165,6 +165,24 @@ impl VfsNodeOps for DirNode {
         }
     }
 
+    fn rename(&self, src_name: &str, dst_name: &str) -> VfsResult {
+        log::debug!("rename {} to {} at ramfs", src_name, dst_name);
+        log::debug!("curr_path in ramfs: {}", self.get_entries().join(", "));
+        let (src_name, _) = get_filename(src_name);
+        let (dst_name, _) = get_filename(dst_name);
+
+        let src_node = self
+            .children
+            .read()
+            .get(src_name)
+            .ok_or(VfsError::NotFound)?
+            .clone();
+
+        self.children.write().remove(src_name);
+        self.children.write().insert(dst_name.into(), src_node);
+        Ok(())
+    }
+
     axfs_vfs::impl_vfs_dir_default! {}
 }
 
@@ -172,5 +190,12 @@ fn split_path(path: &str) -> (&str, Option<&str>) {
     let trimmed_path = path.trim_start_matches('/');
     trimmed_path.find('/').map_or((trimmed_path, None), |n| {
         (&trimmed_path[..n], Some(&trimmed_path[n + 1..]))
+    })
+}
+
+fn get_filename(path: &str) -> (&str, Option<&str>) {
+    let trimmed_path = path.trim_start_matches('/');
+    trimmed_path.rfind('/').map_or((trimmed_path, None), |n| {
+        (&trimmed_path[n + 1..], Some(&trimmed_path[..n]))
     })
 }

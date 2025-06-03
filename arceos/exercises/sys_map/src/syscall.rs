@@ -1,13 +1,16 @@
 #![allow(dead_code)]
 
-use core::ffi::{c_void, c_char, c_int};
-use axhal::arch::TrapFrame;
-use axhal::trap::{register_trap_handler, SYSCALL};
+use arceos_posix_api as api;
 use axerrno::LinuxError;
+use axhal::arch::TrapFrame;
+use axhal::mem::{phys_to_virt, PAGE_SIZE_4K};
+use axhal::paging::MappingFlags;
+use axhal::trap::{register_trap_handler, SYSCALL};
+use axstd::collections::Vec;
 use axtask::current;
 use axtask::TaskExtRef;
-use axhal::paging::MappingFlags;
-use arceos_posix_api as api;
+use core::ffi::{c_char, c_int, c_void};
+use memory_addr::{VirtAddr, VirtAddrRange};
 
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -100,9 +103,14 @@ bitflags::bitflags! {
 fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ax_println!("handle_syscall [{}] ...", syscall_num);
     let ret = match syscall_num {
-         SYS_IOCTL => sys_ioctl(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _,
+        SYS_IOCTL => sys_ioctl(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _,
         SYS_SET_TID_ADDRESS => sys_set_tid_address(tf.arg0() as _),
-        SYS_OPENAT => sys_openat(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _, tf.arg3() as _),
+        SYS_OPENAT => sys_openat(
+            tf.arg0() as _,
+            tf.arg1() as _,
+            tf.arg2() as _,
+            tf.arg3() as _,
+        ),
         SYS_CLOSE => sys_close(tf.arg0() as _),
         SYS_READ => sys_read(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _),
         SYS_WRITE => sys_write(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _),
@@ -110,11 +118,11 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         SYS_EXIT_GROUP => {
             ax_println!("[SYS_EXIT_GROUP]: system is exiting ..");
             axtask::exit(tf.arg0() as _)
-        },
+        }
         SYS_EXIT => {
             ax_println!("[SYS_EXIT]: system is exiting ..");
             axtask::exit(tf.arg0() as _)
-        },
+        }
         SYS_MMAP => sys_mmap(
             tf.arg0() as _,
             tf.arg1() as _,
@@ -140,7 +148,67 @@ fn sys_mmap(
     fd: i32,
     _offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    // 获取当前任务的地址空间
+    let curr_task = current();
+    let mut uspace = curr_task.task_ext().aspace.lock();
+
+    // 设置map_alloc的参数
+    let aligned_len = length
+        .checked_add(memory_addr::PAGE_SIZE_4K - 1)
+        .expect("Overflow in mmap length")
+        & !(memory_addr::PAGE_SIZE_4K - 1);
+
+    let vaddr = if addr.is_null() {
+        uspace
+            .find_free_area(
+                uspace.base() + PAGE_SIZE_4K,
+                aligned_len,
+                VirtAddrRange::new(uspace.base(), uspace.end()),
+            )
+            .expect("No free area found for mmap")
+    } else {
+        unsafe { VirtAddr::from_usize(addr as usize) }
+    };
+
+    let mapping_prot = MappingFlags::from(MmapProt::from_bits(prot).unwrap());
+    let mapping_flags = if flags & MmapFlags::MAP_SHARED.bits() != 0 {
+        true
+    } else if flags & MmapFlags::MAP_PRIVATE.bits() != 0 {
+        true // !TODO: should false
+    } else {
+        unimplemented!("Unsupported mmap flags: {}", flags);
+    };
+
+    // map_alloc
+    uspace
+        .map_alloc(vaddr, aligned_len, mapping_prot, mapping_flags)
+        .unwrap();
+
+    debug!(
+        "sys_mmap in sys_map: addr={:?}, length={}, prot={:#x}, flags={:#x}, fd={}",
+        vaddr, aligned_len, prot, flags, fd
+    );
+
+    // 获取物理地址
+    let (paddr, _, _) = uspace
+        .page_table()
+        .query(vaddr)
+        .unwrap_or_else(|_| panic!("Mapping failed for segment: {:#x}", vaddr));
+
+    // 将数据写入物理地址paddr
+    let mut buf = Vec::with_capacity(aligned_len);
+
+    if fd >= 0 {
+        sys_read(fd, buf.as_mut_ptr() as *mut c_void, aligned_len);
+    }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), phys_to_virt(paddr).as_mut_ptr(), aligned_len);
+    }
+
+    debug!("sys_mmap: mapped {:#x} bytes at {:#x}", aligned_len, vaddr);
+
+    vaddr.as_usize() as isize 
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {
